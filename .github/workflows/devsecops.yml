@@ -1,0 +1,286 @@
+name: devsecops
+# =====================================================================
+#  Pipeline DevSecOps SIMPEL UPNVJ (vuln)  —  MODE REPORT-ONLY
+#  Aplikasi ini SENGAJA penuh kerentanan. Tujuan pipeline: MEMPERLIHATKAN
+#  temuan tiap tool, bukan nge-block merge. Semua job selalu HIJAU.
+#
+#  5 tool:  Semgrep (SAST) · Trivy (SCA/secret/misconfig) ·
+#           OWASP Dependency-Check (SCA) · SonarCloud (SAST) · OWASP ZAP (DAST)
+#
+#  Repo ini PRIVATE, jadi upload SARIF ke tab Security butuh GitHub Advanced
+#  Security. Supaya alert TETAP KELIHATAN tanpa GHAS, tiap job menulis
+#  ringkasan temuan ke **Job Summary** (halaman run Actions) DAN mengunggah
+#  laporan mentah sebagai **Artifacts** yang bisa diunduh.
+#  (Upload SARIF tetap dicoba dengan continue-on-error; otomatis aktif kalau
+#   repo dijadikan public / GHAS dinyalakan.)
+# =====================================================================
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  # ============================ SAST · Semgrep ============================
+  semgrep:
+    name: SAST · Semgrep
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install semgrep
+      - name: Run Semgrep
+        run: |
+          semgrep scan --config auto --sarif --output semgrep.sarif || true
+          semgrep scan --config auto --json  --output semgrep.json  || true
+      - name: Ringkasan temuan Semgrep -> Job Summary
+        if: always()
+        run: |
+          COUNT=$(jq '.results | length' semgrep.json 2>/dev/null || echo 0)
+          {
+            echo "## 🔎 Semgrep (SAST) — ${COUNT} temuan"
+            echo ""
+            echo "| Severity | Rule | Lokasi |"
+            echo "|---|---|---|"
+            jq -r '.results[] | "| \(.extra.severity) | \(.check_id | split(".") | last) | \(.path):\(.start.line) |"' semgrep.json 2>/dev/null | sort | uniq | head -60
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload SARIF ke Security tab (butuh public/GHAS)
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with: { sarif_file: semgrep.sarif, category: semgrep }
+      - name: Upload laporan Semgrep (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: semgrep-report, path: 'semgrep.*' }
+
+  # ==================== SCA + secret + misconfig · Trivy ====================
+  trivy:
+    name: SCA · Trivy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Trivy (tabel ke log)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: table
+          exit-code: '0'
+      - name: Trivy (JSON untuk laporan)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          format: json
+          output: trivy.json
+          exit-code: '0'
+      - name: Ringkasan Trivy -> Job Summary
+        if: always()
+        run: |
+          V=$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy.json 2>/dev/null || echo 0)
+          S=$(jq '[.Results[]?.Secrets[]?] | length' trivy.json 2>/dev/null || echo 0)
+          M=$(jq '[.Results[]?.Misconfigurations[]?] | length' trivy.json 2>/dev/null || echo 0)
+          {
+            echo "## 🛡️ Trivy — ${V} CVE dependensi · ${S} secret · ${M} misconfig"
+            echo ""
+            echo "### Secret ter-hardcode"
+            echo "| File | Rule | Baris |"
+            echo "|---|---|---|"
+            jq -r '.Results[]? | .Target as $t | (.Secrets[]? | "| \($t) | \(.RuleID) | \(.StartLine) |")' trivy.json 2>/dev/null | head -20
+            echo ""
+            echo "### CVE dependensi (top 30)"
+            echo "| Package | ID | Severity |"
+            echo "|---|---|---|"
+            jq -r '.Results[]?.Vulnerabilities[]? | "| \(.PkgName) \(.InstalledVersion) | \(.VulnerabilityID) | \(.Severity) |"' trivy.json 2>/dev/null | sort -u | head -30
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload laporan Trivy (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: trivy-report, path: trivy.json }
+
+  # =============== SCA (CVE/NVD) · OWASP Dependency-Check ===============
+  depcheck:
+    name: SCA · OWASP Dependency-Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - run: npm ci || npm install
+      - name: OWASP Dependency-Check
+        continue-on-error: true
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: simpel-upnvj-devsecops
+          path: .
+          format: 'ALL'
+      - name: Ringkasan Dependency-Check -> Job Summary
+        if: always()
+        run: |
+          J=$(find reports -name 'dependency-check-report.json' 2>/dev/null | head -1)
+          if [ -n "$J" ]; then
+            C=$(jq '[.dependencies[]?.vulnerabilities[]?] | length' "$J" 2>/dev/null || echo 0)
+            {
+              echo "## 📦 OWASP Dependency-Check — ${C} kerentanan"
+              echo ""
+              echo "| Dependency | CVE | Severity |"
+              echo "|---|---|---|"
+              jq -r '.dependencies[]? | .fileName as $f | (.vulnerabilities[]? | "| \($f) | \(.name) | \(.severity) |")' "$J" 2>/dev/null | sort -u | head -40
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## 📦 OWASP Dependency-Check — laporan tidak tersedia (NVD limit?)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload laporan Dependency-Check (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: depcheck-report, path: reports }
+
+  # ===================== SAST · SonarCloud (opsional) =====================
+  sonar:
+    name: SAST · SonarCloud
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: https://sonarcloud.io
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - name: SonarQube Cloud Scan
+        if: ${{ env.SONAR_TOKEN != '' }}
+        continue-on-error: true
+        uses: SonarSource/sonarqube-scan-action@v6
+      - name: Ringkasan SonarCloud -> Job Summary
+        if: ${{ env.SONAR_TOKEN != '' }}
+        run: |
+          sleep 20
+          P=rafliher_simpel-upnvj-devsecops
+          M=$(curl -s "https://sonarcloud.io/api/measures/component?component=$P&metricKeys=vulnerabilities,security_hotspots,bugs,code_smells")
+          V=$(echo "$M" | jq -r '.component.measures[]?|select(.metric=="vulnerabilities").value' 2>/dev/null)
+          B=$(echo "$M" | jq -r '.component.measures[]?|select(.metric=="bugs").value' 2>/dev/null)
+          C=$(echo "$M" | jq -r '.component.measures[]?|select(.metric=="code_smells").value' 2>/dev/null)
+          {
+            echo "## ☁️ SonarCloud — ${V:-?} vulnerabilities · ${B:-?} bugs · ${C:-?} code smells"
+            echo ""
+            echo "Dashboard: https://sonarcloud.io/project/overview?id=$P"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Catatan bila token belum diisi
+        if: ${{ env.SONAR_TOKEN == '' }}
+        run: |
+          {
+            echo "## ☁️ SonarCloud — di-skip (SONAR_TOKEN belum diisi)"
+            echo ""
+            echo "Analisis via CI butuh secret \`SONAR_TOKEN\` **dan** Automatic Analysis (AutoScan) di-nonaktifkan di SonarCloud (keduanya tidak bisa aktif bersamaan)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ========================= DAST · OWASP ZAP =========================
+  dast:
+    name: DAST · OWASP ZAP
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Boot SIMPEL + MySQL (ephemeral)
+        run: |
+          set +e +o pipefail   # curl ke app yang belum siap wajar gagal — jangan matikan step
+          docker compose up -d --build
+          echo "Menunggu LOGIN sukses (app + DB ter-seed) di :8080 ..."
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:8080/login \
+              --data-urlencode "username=admin" --data-urlencode "password=admin123")
+            [ "$code" = "302" ] && { echo "LOGIN SIAP (302)"; break; }
+            echo "  belum siap (HTTP $code) ..."; sleep 5
+          done
+      - name: OWASP ZAP (daemon+API) — TER-LOGIN + active scan (exclude aksi destruktif)
+        run: |
+          set +e +o pipefail   # alur bertahap via curl API — non-zero itu wajar, jangan matikan step
+          # 1) Login -> ambil cookie sesi
+          TOKEN=$(curl -s -i http://localhost:8080/login -X POST \
+            --data-urlencode "username=admin" --data-urlencode "password=admin123" \
+            | grep -i set-cookie | sed 's/.*simpel_session=\([^;]*\).*/\1/')
+          echo "panjang cookie: ${#TOKEN}"
+          [ -z "$TOKEN" ] && echo "::warning::Cookie kosong — login gagal, scan tidak ter-login!"
+          mkdir -p zap-report && chmod 777 zap-report
+          # 2) Pre-pull image dulu supaya 'docker run -d' instan & daemon start bersih
+          docker pull -q ghcr.io/zaproxy/zaproxy:stable
+          docker run -d --name zap --network host -v "$PWD/zap-report:/zap/wrk/:rw" \
+            ghcr.io/zaproxy/zaproxy:stable zap.sh -daemon -host 127.0.0.1 -port 8091 \
+            -config api.disablekey=true -config api.addrs.addr.name=.* -config api.addrs.addr.regex=true
+          A=http://127.0.0.1:8091
+          # 3) Tunggu daemon BENER-BENER siap (version balik angka), lalu beri jeda addons settle
+          echo "Menunggu ZAP daemon siap..."
+          for i in $(seq 1 90); do
+            V=$(curl -s "$A/JSON/core/view/version/" | sed 's/.*"version":"\([^"]*\)".*/\1/')
+            case "$V" in [0-9]*) echo "ZAP siap: v$V"; break;; esac
+            sleep 3
+          done
+          sleep 8
+          # 4) Inject cookie ke tiap request (Replacer) — inilah yang bikin ZAP TER-LOGIN
+          curl -s -G "$A/JSON/replacer/action/addRule/" \
+            --data-urlencode description=auth --data-urlencode enabled=true \
+            --data-urlencode matchType=REQ_HEADER --data-urlencode matchString=Cookie \
+            --data-urlencode matchRegex=false --data-urlencode "replacement=simpel_session=$TOKEN" >/dev/null
+          # 5) Exclude aksi destruktif via GET: /logout (matikan sesi) & /admin/users/hapus (DELETE user)
+          for RX in ".*/logout.*" ".*/admin/users/hapus.*"; do
+            curl -s -G "$A/JSON/spider/action/excludeFromScan/" --data-urlencode "regex=$RX" >/dev/null
+            curl -s -G "$A/JSON/ascan/action/excludeFromScan/"  --data-urlencode "regex=$RX" >/dev/null
+          done
+          # 6) Batasi durasi agar tidak runaway
+          curl -s "$A/JSON/spider/action/setOptionMaxDuration/?Integer=5" >/dev/null
+          curl -s "$A/JSON/ascan/action/setOptionMaxScanDurationInMins/?Integer=15" >/dev/null
+          # 7) Akses seed dulu supaya masuk site tree, lalu Spider
+          curl -s "$A/JSON/core/action/accessUrl/?url=http://localhost:8080/dashboard" >/dev/null
+          SID=$(curl -s -G "$A/JSON/spider/action/scan/" --data-urlencode "url=http://localhost:8080/dashboard" --data-urlencode recurse=true | sed 's/.*"scan":"\([0-9]*\)".*/\1/')
+          echo "spider id: $SID"
+          for i in $(seq 1 120); do
+            P=$(curl -s "$A/JSON/spider/view/status/?scanId=$SID" | sed 's/.*"status":"\([0-9]*\)".*/\1/')
+            echo "  spider ${P:-?}%"; [ "$P" = "100" ] && break; sleep 3
+          done
+          echo "URL ter-temu: $(curl -s "$A/JSON/spider/view/results/?scanId=$SID" | grep -o "http" | wc -l)"
+          # 8) ACTIVE scan (nembak payload SQLi/XSS/SSTI/dll)
+          ASID=$(curl -s -G "$A/JSON/ascan/action/scan/" --data-urlencode "url=http://localhost:8080" --data-urlencode recurse=true --data-urlencode inScopeOnly=false | sed 's/.*"scan":"\([0-9]*\)".*/\1/')
+          echo "ascan id: $ASID"
+          echo "$ASID" | grep -qE '^[0-9]+$' || echo "::warning::ascan gagal start -> $(curl -s -G "$A/JSON/ascan/action/scan/" --data-urlencode "url=http://localhost:8080" --data-urlencode recurse=true)"
+          for i in $(seq 1 200); do
+            P=$(curl -s "$A/JSON/ascan/view/status/?scanId=$ASID" | sed 's/.*"status":"\([0-9]*\)".*/\1/')
+            echo "  ascan ${P:-?}%"; [ "$P" = "100" ] && break; sleep 6
+          done
+          for i in $(seq 1 60); do
+            R=$(curl -s "$A/JSON/pscan/view/recordsToScan/" | sed 's/.*"recordsToScan":"\([0-9]*\)".*/\1/')
+            [ "${R:-1}" = "0" ] && break; sleep 2
+          done
+          # 9) Simpan laporan
+          echo "total alert: $(curl -s "$A/JSON/core/view/numberOfAlerts/" | sed 's/.*"numberOfAlerts":"\([0-9]*\)".*/\1/')"
+          curl -s "$A/OTHER/core/other/htmlreport/" -o zap-report/zap-report.html
+          curl -s "$A/JSON/core/view/alerts/?baseurl=http://localhost:8080&count=9999" -o zap-report/zap-report.json
+          docker rm -f zap >/dev/null 2>&1 || true
+      - name: Ringkasan ZAP -> Job Summary
+        if: always()
+        run: |
+          J=zap-report/zap-report.json
+          if [ -f "$J" ]; then
+            H=$(jq '[.alerts[]?|select(.risk=="High")]|length' "$J" 2>/dev/null || echo 0)
+            M=$(jq '[.alerts[]?|select(.risk=="Medium")]|length' "$J" 2>/dev/null || echo 0)
+            {
+              echo "## 🕷️ OWASP ZAP (DAST, ter-login + active) — ${H} High · ${M} Medium"
+              echo ""
+              echo "| Risk | Alert | Parameter |"
+              echo "|---|---|---|"
+              jq -r '.alerts[]? | "| \(.risk) | \(.alert) | \(.param) |"' "$J" 2>/dev/null | sort -u | head -60
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## 🕷️ OWASP ZAP — laporan tidak tersedia" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload laporan ZAP (artifact)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: zap-report, path: zap-report/ }
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
